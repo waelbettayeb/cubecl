@@ -1364,6 +1364,10 @@ impl ServerStorage for CudaServer {
         // whatever was there before.
         self.streams.ensure_written([&binding].into_iter())?;
         let mut command = self.command(stream_id, [&binding].into_iter())?;
-        Ok(command.managed_resource(binding)?)
+        let stream = command.stream().sys;
+        let mut resource = command.managed_resource(binding)?;
+        // Native work (e.g. cuBLAS) on this stream is ordered with the client's launches.
+        resource.resource_mut().stream = stream;
+        Ok(resource)
     }
 }
