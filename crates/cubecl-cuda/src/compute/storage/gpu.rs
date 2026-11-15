@@ -40,12 +40,20 @@ pub struct GpuResource {
     pub binding: *mut std::ffi::c_void,
     /// The size of the resource.
     pub size: u64,
+    /// The stream work on this resource must be queued on to stay in order with the
+    /// client's launches: set by `get_resource` (the client's current stream), null otherwise.
+    pub stream: cudarc::driver::sys::CUstream,
 }
 
 impl GpuResource {
     /// Creates a new [`GpuResource`].
     pub fn new(ptr: u64, binding: *mut std::ffi::c_void, size: u64) -> Self {
-        Self { ptr, binding, size }
+        Self {
+            ptr,
+            binding,
+            size,
+            stream: std::ptr::null_mut(),
+        }
     }
 }
 

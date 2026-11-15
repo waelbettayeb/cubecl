@@ -63,3 +63,9 @@ Upstream #1858 cherry-picked with `-x`; conflicts only where it touches code 0.1
   cells, takes its rows' max over the plane, computes `scale[row] * x - rowmax`, writes back, and a
   second MMA accumulates onto the result; exact against the CPU for f32/f32, f16/f32, f16/f16 and
   bf16/bf16.
+
+## CUDA: the stream with `get_resource`
+
+`client.get_resource::<CudaServer>(handle)` also fills `GpuResource::stream`: the client's current
+stream (the one its launches go to, already waiting on the buffer's own stream). Native work queued
+there (sdp's cuBLAS GEMMs) stays in order with CubeCL's launches, no sync.
