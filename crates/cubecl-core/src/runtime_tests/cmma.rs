@@ -1392,6 +1392,176 @@ pub fn test_cmma_manual_places_every_cell<
     );
 }
 
+/// `out = A B + (diag(scale) (A B) - rowmax(A B))` on one 8x8x8 manual MMA, the second half done
+/// in registers: an attention softmax's rescale (`o = f o + p v`) without shared memory.
+///
+/// Each unit reads its accumulator cells, takes its rows' max over the plane, scales and shifts
+/// its cells, writes them back and accumulates a second product onto them. The row max uses the
+/// Metal 8x8 layout (`MmaDefinition::position_of_nth`): a row's 8 cells are held by the 4 lanes
+/// that differ in lane bits 0 and 3, so two `plane_shuffle_xor`s (1 and 8) reduce it.
+#[cube(launch)]
+pub fn kernel_manual_row_rescale<A: Float, CD: Float>(
+    a: &Tensor<A>,
+    b: &Tensor<A>,
+    scale: &Tensor<f32>,
+    out: &mut Tensor<CD>,
+) {
+    let def = cmma::MmaDefinition::<A, A, CD>::new(8usize, 8usize, 8usize);
+    let lane_id = UNIT_POS_PLANE;
+
+    let va = def.vector_size(MatrixIdent::A);
+    let size!(NA) = va;
+    let elems_a = def.elems_per_lane(MatrixIdent::A);
+    let count_a = comptime!(elems_a / va);
+    let mut registers_a = Array::<Vector<A, NA>>::new(count_a);
+    #[unroll]
+    for i in 0..count_a {
+        let mut reg = Vector::empty();
+        #[unroll]
+        for e in 0..va {
+            let (row, col) = def.position_of_nth(lane_id, (i * va + e) as u32, MatrixIdent::A);
+            reg.insert(e, a[(row * 8 + col) as usize]);
+        }
+        registers_a[i] = reg;
+    }
+
+    let vb = def.vector_size(MatrixIdent::B);
+    let size!(NB) = vb;
+    let elems_b = def.elems_per_lane(MatrixIdent::B);
+    let count_b = comptime!(elems_b / vb);
+    let mut registers_b = Array::<Vector<A, NB>>::new(count_b);
+    #[unroll]
+    for i in 0..count_b {
+        let mut reg = Vector::empty();
+        #[unroll]
+        for e in 0..vb {
+            let (row, col) = def.position_of_nth(lane_id, (i * vb + e) as u32, MatrixIdent::B);
+            reg.insert(e, b[(row * 8 + col) as usize]);
+        }
+        registers_b[i] = reg;
+    }
+
+    let vc = def.vector_size(MatrixIdent::Accumulator);
+    let size!(NC) = vc;
+    let elems_c = def.elems_per_lane(MatrixIdent::Accumulator);
+    let count_c = comptime!(elems_c / vc);
+    let mut acc = Array::<Vector<CD, NC>>::new(count_c);
+    #[unroll]
+    for i in 0..count_c {
+        acc[i] = Vector::cast_from(CD::from_int(0));
+    }
+
+    def.execute_inplace(&registers_a, &registers_b, &mut acc);
+
+    // The row max: each cell's own row, reduced over the plane in f32.
+    #[unroll]
+    for i in 0..count_c {
+        let mut reg = acc[i];
+        #[unroll]
+        for e in 0..vc {
+            let (row, _col) =
+                def.position_of_nth(lane_id, (i * vc + e) as u32, MatrixIdent::Accumulator);
+            let mut row_max = f32::cast_from(reg.extract(e));
+            #[unroll]
+            for e2 in 0..vc {
+                let (row2, _col2) =
+                    def.position_of_nth(lane_id, (i * vc + e2) as u32, MatrixIdent::Accumulator);
+                if row2 == row {
+                    row_max = max(row_max, f32::cast_from(reg.extract(e2)));
+                }
+            }
+            row_max = max(row_max, plane_shuffle_xor(row_max, 1));
+            row_max = max(row_max, plane_shuffle_xor(row_max, 8));
+
+            let value = f32::cast_from(reg.extract(e)) * scale[row as usize] - row_max;
+            reg.insert(e, CD::cast_from(value));
+        }
+        acc[i] = reg;
+    }
+
+    def.execute_inplace(&registers_a, &registers_b, &mut acc);
+
+    #[unroll]
+    for i in 0..count_c {
+        let reg = acc[i];
+        #[unroll]
+        for e in 0..vc {
+            let (row, col) =
+                def.position_of_nth(lane_id, (i * vc + e) as u32, MatrixIdent::Accumulator);
+            out[(row * 8 + col) as usize] = reg.extract(e);
+        }
+    }
+}
+
+/// [`kernel_manual_row_rescale`] against the CPU. Every value is a small integer or a power of
+/// two, so each type holds the product exactly and the comparison is exact.
+pub fn test_cmma_manual_row_rescale<R: Runtime, A: Float + CubeElement, CD: Float + CubeElement>(
+    client: Client,
+    cube_dimensions: CubeDim,
+) {
+    if !client.features().matmul.mma.contains(&MmaConfig {
+        a_type: A::cube_type(),
+        b_type: A::cube_type(),
+        cd_type: CD::cube_type(),
+        m: 8,
+        n: 8,
+        k: 8,
+    }) {
+        println!(
+            "Skipping test for a, b: {:?}, cd: {:?}, 8x8x8",
+            A::cube_type(),
+            CD::cube_type()
+        );
+        return;
+    }
+
+    let lhs: Vec<i64> = (0..64).map(|cell| ((cell * 5 + cell / 8) % 4) as i64).collect();
+    let rhs: Vec<i64> = (0..64).map(|cell| ((cell * 7 + 3) % 3) as i64).collect();
+    let scale: Vec<f32> = (0..8).map(|row| [0.5, 1.0, 2.0, 0.25][row % 4]).collect();
+
+    let product: Vec<f32> = (0..64)
+        .map(|cell| {
+            let (row, col) = (cell / 8, cell % 8);
+            (0..8).map(|l| lhs[row * 8 + l] * rhs[l * 8 + col]).sum::<i64>() as f32
+        })
+        .collect();
+    let expected: Vec<f32> = (0..64)
+        .map(|cell| {
+            let row = cell / 8;
+            let row_max = product[row * 8..row * 8 + 8]
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            product[cell] + (product[cell] * scale[row] - row_max)
+        })
+        .collect();
+
+    let to_a = |values: &[i64]| -> Vec<A> { values.iter().map(|v| A::from_int(*v)).collect() };
+    let lhs = client.create_from_slice(A::as_bytes(&to_a(&lhs)));
+    let rhs = client.create_from_slice(A::as_bytes(&to_a(&rhs)));
+    let scale = client.create_from_slice(f32::as_bytes(&scale));
+    let out = client.empty(64 * size_of::<CD>());
+
+    unsafe {
+        kernel_manual_row_rescale::launch::<A, CD>(
+            &client,
+            CubeCount::Static(1, 1, 1),
+            cube_dimensions,
+            TensorArg::from_raw_parts(lhs, [8, 1].into(), [8, 8].into()),
+            TensorArg::from_raw_parts(rhs, [8, 1].into(), [8, 8].into()),
+            TensorArg::from_raw_parts(scale, [1].into(), [8].into()),
+            TensorArg::from_raw_parts(out.clone(), [8, 1].into(), [8, 8].into()),
+        )
+    };
+
+    let actual = client.read_one_unchecked(out);
+    let actual: Vec<f32> = CD::from_bytes(&actual)
+        .iter()
+        .map(|value| value.to_f32().unwrap())
+        .collect();
+    assert_eq!(actual, expected);
+}
+
 // Kinda hardcoded for f16 right now, but it's hard to make generic
 #[cube(launch)]
 pub fn kernel_manual_ldmatrix<AB: Numeric, CD: Numeric, N: Size>(
@@ -2140,6 +2310,26 @@ macro_rules! testgen_cmma {
             test::<f16, f16, f16>(8);
             test::<bf16, bf16, bf16>(8);
             test::<f32, f32, f32>(8);
+        }
+
+        #[$crate::runtime_tests::test_log::test]
+        fn test_cmma_manual_row_rescale() {
+            use half::{bf16, f16};
+
+            fn test<A: Float + CubeElement, CD: Float + CubeElement>() {
+                let client = TestRuntime::client(&Default::default());
+                let cube_dimensions = cube_dim::<TestRuntime>(&client);
+                cubecl_core::runtime_tests::cmma::test_cmma_manual_row_rescale::<TestRuntime, A, CD>(
+                    client,
+                    cube_dimensions,
+                )
+            }
+
+            // Metal
+            test::<f32, f32>();
+            test::<f16, f32>();
+            test::<f16, f16>();
+            test::<bf16, bf16>();
         }
 
         #[$crate::runtime_tests::test_log::test]
